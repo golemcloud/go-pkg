@@ -45,17 +45,21 @@ type taskState struct {
 	pending     map[uint32]chan uint32
 	yielding    chan unit
 	pinner      runtime.Pinner
+	// timers are the host clock waits armed so that the host resumes the task
+	// when a Go timer is due, by subtask, with the runtime time they are due at.
+	timers map[uint32]int64
+	// done records that the task's closure has returned, after which a pending
+	// Go timer no longer keeps the task alive.
+	done bool
 }
 
 var state *taskState = nil
 
 func Run(closure func()) uint32 {
 	state = &taskState{
-		make(chan unit),
-		0,
-		make(map[uint32]chan uint32),
-		nil,
-		runtime.Pinner{},
+		channel: make(chan unit),
+		pending: make(map[uint32]chan uint32),
+		timers:  make(map[uint32]int64),
 	}
 	state.pinner.Pin(state)
 
@@ -63,7 +67,11 @@ func Run(closure func()) uint32 {
 		state = nil
 	}()
 
-	go closure()
+	task := state
+	go func() {
+		closure()
+		task.done = true
+	}()
 
 	return callback(EVENT_NONE, 0, 0)
 }
@@ -77,6 +85,9 @@ func Callback(event0, event1, event2 uint32) uint32 {
 
 //go:linkname wasiOnIdle runtime.wasiOnIdle
 func wasiOnIdle(callback func() bool)
+
+//go:linkname wasiIdleTimer runtime.wasiIdleTimer
+func wasiIdleTimer() (now int64, pollUntil int64)
 
 func callback(event0, event1, event2 uint32) uint32 {
 	yielding := state.yielding
@@ -115,6 +126,12 @@ func callback(event0, event1, event2 uint32) uint32 {
 			case STATUS_RETURNED:
 				waitableJoin(event1, 0)
 				subtaskDrop(event1)
+				if _, timer := state.timers[event1]; timer {
+					// The Go timer it stood for is due; the scheduler runs
+					// it before waking this goroutine again.
+					delete(state.timers, event1)
+					break
+				}
 				channel := state.pending[event1]
 				delete(state.pending, event1)
 				channel <- event2
@@ -157,19 +174,82 @@ func callback(event0, event1, event2 uint32) uint32 {
 					return CALLBACK_CODE_YIELD
 				}
 			}
-		} else if len(state.pending) == 0 {
-			state.pinner.Unpin()
-			if state.waitableSet != 0 {
-				waitableSetDrop(state.waitableSet)
-			}
-			return CALLBACK_CODE_EXIT
 		} else {
+			timer := timerNone
+			if !state.done {
+				timer = armTimer()
+			}
+			if timer == timerDue {
+				// The timer is already due: give the host a turn, then let
+				// the scheduler run it.
+				contextSet(unsafe.Pointer(state))
+				return CALLBACK_CODE_YIELD
+			}
+			if len(state.pending) == 0 && timer == timerNone {
+				cancelTimers()
+				state.pinner.Unpin()
+				if state.waitableSet != 0 {
+					waitableSetDrop(state.waitableSet)
+				}
+				return CALLBACK_CODE_EXIT
+			}
 			if state.waitableSet == 0 {
 				panic("unreachable")
 			}
 			contextSet(unsafe.Pointer(state))
 			return CALLBACK_CODE_WAIT | (state.waitableSet << 4)
 		}
+	}
+}
+
+const (
+	timerNone = iota
+	timerArmed
+	timerDue
+)
+
+// armTimer makes sure the host resumes the task when the runtime's next timer
+// is due, by waiting on a host clock wait that ends then. Go timers are not
+// waitables, so without one a task whose goroutines wait on a timer would be
+// left suspended, or would exit without producing its result.
+func armTimer() int {
+	now, due := wasiIdleTimer()
+	if due == 0 {
+		return timerNone
+	}
+	for _, at := range state.timers {
+		if at <= due {
+			return timerArmed
+		}
+	}
+	delay := due - now
+	if delay < 0 {
+		delay = 0
+	}
+	status := uint32(monotonicWaitFor(delay))
+	subtask := status >> 4
+	switch status & 0xF {
+	case STATUS_STARTING, STATUS_STARTED:
+		if state.waitableSet == 0 {
+			state.waitableSet = waitableSetNew()
+		}
+		waitableJoin(subtask, state.waitableSet)
+		state.timers[subtask] = due
+		return timerArmed
+	case STATUS_RETURNED:
+		return timerDue
+	default:
+		panic(fmt.Sprintf("unexpected subtask status: %v", status&0xF))
+	}
+}
+
+// cancelTimers ends the clock waits still pending when the task exits.
+func cancelTimers() {
+	for subtask := range state.timers {
+		waitableJoin(subtask, 0)
+		subtaskCancel(subtask)
+		subtaskDrop(subtask)
+		delete(state.timers, subtask)
 	}
 }
 
@@ -244,3 +324,11 @@ func contextSet(value unsafe.Pointer)
 //go:wasmimport $root [subtask-drop]
 //go:noescape
 func subtaskDrop(subtask uint32)
+
+//go:wasmimport $root [subtask-cancel]
+//go:noescape
+func subtaskCancel(subtask uint32) uint32
+
+//go:wasmimport wasi:clocks/monotonic-clock@0.3.0 [async-lower]wait-for
+//go:noescape
+func monotonicWaitFor(howLong int64) int32
