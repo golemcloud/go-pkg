@@ -42,12 +42,15 @@ type unit struct{}
 type taskState struct {
 	channel     chan unit
 	waitableSet uint32
-	pending     map[uint32]chan uint32
-	yielding    chan unit
-	pinner      runtime.Pinner
-	// timers are the host clock waits armed so that the host resumes the task
-	// when a Go timer is due, by subtask, with the runtime time they are due at.
-	timers map[uint32]int64
+	// pending are the goroutines waiting on a waitable. A slice, not a map: a
+	// map that becomes empty is reseeded from the program's random state.
+	pending  []pendingWait
+	yielding chan unit
+	pinner   runtime.Pinner
+	// waits are the host clock waits armed so that the host resumes the task
+	// when a Go timer is due. A slice, not a map: iterating a map draws from the
+	// program's random state.
+	waits []clockWait
 	// done records that the task's closure has returned, after which a pending
 	// Go timer no longer keeps the task alive.
 	done bool
@@ -58,8 +61,6 @@ var state *taskState = nil
 func Run(closure func()) uint32 {
 	state = &taskState{
 		channel: make(chan unit),
-		pending: make(map[uint32]chan uint32),
-		timers:  make(map[uint32]int64),
 	}
 	state.pinner.Pin(state)
 
@@ -85,9 +86,6 @@ func Callback(event0, event1, event2 uint32) uint32 {
 
 //go:linkname wasiOnIdle runtime.wasiOnIdle
 func wasiOnIdle(callback func() bool)
-
-//go:linkname wasiIdleTimer runtime.wasiIdleTimer
-func wasiIdleTimer() (now int64, pollUntil int64)
 
 func callback(event0, event1, event2 uint32) uint32 {
 	yielding := state.yielding
@@ -126,15 +124,15 @@ func callback(event0, event1, event2 uint32) uint32 {
 			case STATUS_RETURNED:
 				waitableJoin(event1, 0)
 				subtaskDrop(event1)
-				if _, timer := state.timers[event1]; timer {
-					// The Go timer it stood for is due; the scheduler runs
-					// it before waking this goroutine again.
-					delete(state.timers, event1)
+				if i := waitIndex(event1); i >= 0 {
+					// The Go timers it stood for are due; the scheduler runs
+					// them before waking this goroutine again.
+					w := state.waits[i]
+					state.waits = append(state.waits[:i], state.waits[i+1:]...)
+					wasiAdvanceTime(w.dom, w.due)
 					break
 				}
-				channel := state.pending[event1]
-				delete(state.pending, event1)
-				channel <- event2
+				takePending(event1) <- event2
 
 			default:
 				panic("todo")
@@ -142,9 +140,7 @@ func callback(event0, event1, event2 uint32) uint32 {
 
 		case EVENT_STREAM_READ, EVENT_STREAM_WRITE, EVENT_FUTURE_READ, EVENT_FUTURE_WRITE:
 			waitableJoin(event1, 0)
-			channel := state.pending[event1]
-			delete(state.pending, event1)
-			channel <- event2
+			takePending(event1) <- event2
 
 		default:
 			panic("todo")
@@ -208,49 +204,136 @@ const (
 	timerDue
 )
 
+type pendingWait struct {
+	waitable uint32
+	channel  chan uint32
+}
+
+func takePending(waitable uint32) chan uint32 {
+	for i, p := range state.pending {
+		if p.waitable == waitable {
+			state.pending = append(state.pending[:i], state.pending[i+1:]...)
+			return p.channel
+		}
+	}
+	panic(fmt.Sprintf("no goroutine waits on waitable %v", waitable))
+}
+
+// clockWait is a host clock wait armed for the timers of one runtime domain.
+type clockWait struct {
+	subtask uint32
+	due     int64
+	dom     unsafe.Pointer
+}
+
+//go:linkname wasiIdleWait runtime.wasiIdleWait
+func wasiIdleWait(i int) (dom, ctx unsafe.Pointer, due int64, ok bool)
+
+//go:linkname wasiInstallContext runtime.wasiInstallContext
+func wasiInstallContext(ctx unsafe.Pointer)
+
+//go:linkname wasiGetContext runtime.wasiGetContext
+func wasiGetContext() unsafe.Pointer
+
+//go:linkname wasiAdvanceTime runtime.wasiAdvanceTime
+func wasiAdvanceTime(dom unsafe.Pointer, t int64)
+
+func waitIndex(subtask uint32) int {
+	for i, w := range state.waits {
+		if w.subtask == subtask {
+			return i
+		}
+	}
+	return -1
+}
+
 // armTimer makes sure the host resumes the task when the runtime's next timer
 // is due, by waiting on a host clock wait that ends then. Go timers are not
 // waitables, so without one a task whose goroutines wait on a timer would be
 // left suspended, or would exit without producing its result.
+//
+// The runtime keeps a clock per domain, and a domain's timers fire against its
+// own clock. Each domain with a pending timer gets its own wait, armed in the
+// domain's host context, until the due time of its next timer, so no clock is
+// read here and the wait belongs to the part of the program whose timer it is.
 func armTimer() int {
-	now, due := wasiIdleTimer()
-	if due == 0 {
-		return timerNone
-	}
-	for _, at := range state.timers {
-		if at <= due {
-			return timerArmed
+	result := timerNone
+	own := wasiGetContext()
+	for i := 0; ; i++ {
+		dom, ctx, due, ok := wasiIdleWait(i)
+		if !ok {
+			break
+		}
+		if due == 0 {
+			continue
+		}
+		armed := false
+		for _, w := range state.waits {
+			if w.dom == dom && w.due <= due {
+				armed = true
+				break
+			}
+		}
+		if armed {
+			if result == timerNone {
+				result = timerArmed
+			}
+			continue
+		}
+		wasiInstallContext(ctx)
+		status := uint32(monotonicWaitUntil(due))
+		wasiInstallContext(own)
+		subtask := status >> 4
+		switch status & 0xF {
+		case STATUS_STARTING, STATUS_STARTED:
+			if state.waitableSet == 0 {
+				state.waitableSet = waitableSetNew()
+			}
+			waitableJoin(subtask, state.waitableSet)
+			state.waits = append(state.waits, clockWait{subtask, due, dom})
+			if result == timerNone {
+				result = timerArmed
+			}
+		case STATUS_RETURNED:
+			wasiAdvanceTime(dom, due)
+			result = timerDue
+		default:
+			panic(fmt.Sprintf("unexpected subtask status: %v", status&0xF))
 		}
 	}
-	delay := due - now
-	if delay < 0 {
-		delay = 0
-	}
-	status := uint32(monotonicWaitFor(delay))
-	subtask := status >> 4
-	switch status & 0xF {
-	case STATUS_STARTING, STATUS_STARTED:
-		if state.waitableSet == 0 {
-			state.waitableSet = waitableSetNew()
-		}
-		waitableJoin(subtask, state.waitableSet)
-		state.timers[subtask] = due
-		return timerArmed
-	case STATUS_RETURNED:
-		return timerDue
-	default:
-		panic(fmt.Sprintf("unexpected subtask status: %v", status&0xF))
-	}
+	return result
 }
 
 // cancelTimers ends the clock waits still pending when the task exits.
 func cancelTimers() {
-	for subtask := range state.timers {
-		waitableJoin(subtask, 0)
-		subtaskCancel(subtask)
-		subtaskDrop(subtask)
-		delete(state.timers, subtask)
+	for _, w := range state.waits {
+		cancelWait(w.subtask)
 	}
+	state.waits = nil
+}
+
+func cancelWait(subtask uint32) {
+	waitableJoin(subtask, 0)
+	subtaskCancel(subtask)
+	subtaskDrop(subtask)
+}
+
+// CancelClockWaits ends the clock waits armed for the runtime domain dom. A
+// program calls it when it closes a domain whose timers it has stopped, while
+// the host context the waits were armed in is still valid.
+func CancelClockWaits(dom unsafe.Pointer) {
+	if state == nil {
+		return
+	}
+	kept := state.waits[:0]
+	for _, w := range state.waits {
+		if w.dom == dom {
+			cancelWait(w.subtask)
+		} else {
+			kept = append(kept, w)
+		}
+	}
+	state.waits = kept
 }
 
 func SubtaskWait(status uint32) {
@@ -264,7 +347,7 @@ func SubtaskWait(status uint32) {
 		}
 		waitableJoin(subtask, state.waitableSet)
 		channel := make(chan uint32)
-		state.pending[subtask] = channel
+		state.pending = append(state.pending, pendingWait{subtask, channel})
 		(<-channel)
 
 	case STATUS_RETURNED:
@@ -281,7 +364,7 @@ func FutureOrStreamWait(code uint32, handle int32) (uint32, uint32) {
 		}
 		waitableJoin(uint32(handle), state.waitableSet)
 		channel := make(chan uint32)
-		state.pending[uint32(handle)] = channel
+		state.pending = append(state.pending, pendingWait{uint32(handle), channel})
 		code = (<-channel)
 	}
 
@@ -329,6 +412,6 @@ func subtaskDrop(subtask uint32)
 //go:noescape
 func subtaskCancel(subtask uint32) uint32
 
-//go:wasmimport wasi:clocks/monotonic-clock@0.3.0 [async-lower]wait-for
+//go:wasmimport wasi:clocks/monotonic-clock@0.3.0 [async-lower]wait-until
 //go:noescape
-func monotonicWaitFor(howLong int64) int32
+func monotonicWaitUntil(when int64) int32
