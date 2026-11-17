@@ -45,6 +45,14 @@ draw from the program's random state. The task state is shared by every part of
 the program, so a map there would let a part of the program that a durable host
 skips on replay shift the random stream of the rest.
 
+Lookups stay constant-time without a map. The host numbers the waitable
+handles of a component instance from 1 and reuses freed numbers, so the waiting
+goroutines and clock waits are kept in a slice indexed by handle, which is only
+as long as the most handles alive at once. The clock waits are also kept in the
+order of their domains in the runtime's domain list, so each idle transition
+walks the domains and the waits together, once. `wit/async/async_bench_test.go`
+measures both at 10, 100 and 1,000 waits or domains.
+
 ## Branches and tags
 
 `golem-v0.2` carries the patch on top of the upstream release it is based on.
